@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 from __future__ import print_function
 from collections import OrderedDict
 
@@ -20,7 +21,7 @@ import sys
 import codecs
 import re
 import numpy as np
-
+import pandas as pd
 from data_preprocessing import load_sentences, update_tag_scheme, word_mapping, char_mapping, tag_mapping, \
     prepare_dataset
 
@@ -41,11 +42,12 @@ parameters['embedding_path'] = "./data/glove.6B.100d.txt" #Location of pretraine
 parameters['all_emb'] = 1 #Load all embeddings
 parameters['crf'] =1 #Use CRF (0 to disable)
 parameters['dropout'] = 0.5 #Droupout on the input (0 = no dropout)
-parameters['epoch'] =  50 #Number of epochs to run"
+parameters['epoch'] =  15 #Number of epochs to run"
 parameters['weights'] = "" #path to Pretrained for from a previous run
 parameters['name'] = "self-trained-model" # Model name
 parameters['gradient_clip']=5.0
 parameters['char_mode']="CNN"
+parameters['encoder_mode']="LSTM"
 models_path = "./models/" #path to saved models
 #GPU
 parameters['use_gpu'] = torch.cuda.is_available() #GPU Check
@@ -313,9 +315,11 @@ def forward_calc(self, sentence, chars, chars2_length, d):
     The function calls viterbi decode and generates the
     most probable sequence of tags for the sentence
     '''
-
+    if self.encoder_mode == 'LSTM':
     # Get the emission scores from the BiLSTM
-    feats = self._get_lstm_features(sentence, chars, chars2_length, d)
+        feats = self._get_lstm_features(sentence, chars, chars2_length, d)
+    else:
+        feats = self._get_cnn_features(sentence, chars, chars2_length, d)
     # viterbi to get tag_seq
 
     # Find the best path, given the features.
@@ -392,10 +396,88 @@ def get_lstm_features(self, sentence, chars2, chars2_length, d):
 
     return lstm_feats
 
+def get_cnn_features(self, sentence, chars2, chars2_length, d):
+
+    if self.char_mode == 'LSTM':
+        
+            chars_embeds = self.char_embeds(chars2).transpose(0, 1)
+            
+            packed = torch.nn.utils.rnn.pack_padded_sequence(chars_embeds, chars2_length)
+            
+            lstm_out, _ = self.char_lstm(packed)
+            
+            outputs, output_lengths = torch.nn.utils.rnn.pad_packed_sequence(lstm_out)
+            
+            outputs = outputs.transpose(0, 1)
+            
+            chars_embeds_temp = Variable(torch.FloatTensor(torch.zeros((outputs.size(0), outputs.size(2)))))
+            
+            if self.use_gpu:
+                chars_embeds_temp = chars_embeds_temp.cuda()
+            
+            for i, index in enumerate(output_lengths):
+                chars_embeds_temp[i] = torch.cat((outputs[i, index-1, :self.char_lstm_dim], outputs[i, 0, self.char_lstm_dim:]))
+            
+            chars_embeds = chars_embeds_temp.clone()
+            
+            for i in range(chars_embeds.size(0)):
+                chars_embeds[d[i]] = chars_embeds_temp[i]
+    
+    
+    if self.char_mode == 'CNN':
+        chars_embeds = self.char_embeds(chars2).unsqueeze(1)
+
+        ## Creating Character level representation using Convolutional Neural Netowrk
+        ## followed by a Maxpooling Layer
+        chars_cnn_out3 = self.char_cnn3(chars_embeds)
+        chars_embeds = nn.functional.max_pool2d(chars_cnn_out3,
+                                             kernel_size=(chars_cnn_out3.size(2), 1)).view(chars_cnn_out3.size(0), self.out_channels)
+
+    ## Loading word embeddings
+    embeds = self.word_embeds(sentence)
+
+    ## We concatenate the word embeddings and the character level representation
+    ## to create unified representation for each word
+    embeds = torch.cat((embeds, chars_embeds), 1)
+    embeds = embeds.unsqueeze(1).unsqueeze(1)
+    # print(f'\nembeds: {embeds.size()}')
+
+    ## Word lstm
+    ## Takes words as input and generates an output
+    cnn_out = self.conv1(embeds)
+    # print(f'conv1: {cnn_out.size()}')
+
+    ## Maxpool on the lstm output
+    cnn_out = self.maxpool1(cnn_out)
+    # print(f'maxpool1: {cnn_out.size()}')
+
+    # 2-layer CNN word-level encoder
+    if parameters['encoder_mode'] == 'CNN2':
+      cnn_out = self.conv2(cnn_out)
+      cnn_out = self.maxpool2(cnn_out)
+
+    # 3-layer CNN word-level encoder
+    if parameters['encoder_mode'] == 'CNN3' or parameters['encoder_mode'] == 'CNN_DILATED':
+      cnn_out = self.conv2(cnn_out)
+      cnn_out = self.maxpool2(cnn_out)
+      cnn_out = self.conv3(cnn_out)
+      cnn_out = self.maxpool3(cnn_out)
+
+    ## Reshaping the outputs from the cnn layer
+    cnn_out = cnn_out.squeeze(-1).squeeze(-1)
+
+    ## Linear layer converts the ouput vectors to tag space
+    cnn_feats = self.hidden2tag(cnn_out)
+    
+    return cnn_feats
+
 def get_neg_log_likelihood(self, sentence, tags, chars2, chars2_length, d):
     # sentence, tags is a list of ints
     # features is a 2D tensor, len(sentence) * self.tagset_size
-    feats = self._get_lstm_features(sentence, chars2, chars2_length, d)
+    if self.encoder_mode == 'LSTM':
+      feats = self._get_lstm_features(sentence, chars2, chars2_length, d)
+    else:
+      feats = self._get_cnn_features(sentence, chars2, chars2_length, d)
 
     if self.use_crf:
         forward_score = self._forward_alg(feats)
@@ -411,7 +493,7 @@ class BiLSTM_CRF(nn.Module):
 
     def __init__(self, vocab_size, tag_to_ix, embedding_dim, hidden_dim,
                  char_to_ix=None, pre_word_embeds=None, char_out_dimension=25, char_embedding_dim=25, use_gpu=False
-                 , use_crf=True, char_mode='CNN'):
+                 , use_crf=True, char_mode='CNN', encoder_mode='LSTM'):
         '''
         Input parameters:
 
@@ -442,6 +524,7 @@ class BiLSTM_CRF(nn.Module):
         self.out_channels = char_out_dimension
         self.char_mode = char_mode
         self.char_lstm_dim = char_out_dimension
+        self.encoder_mode = encoder_mode
 
         if char_embedding_dim is not None:
             self.char_embedding_dim = char_embedding_dim
@@ -475,16 +558,79 @@ class BiLSTM_CRF(nn.Module):
         # Lstm Layer:
         # input dimension: word embedding dimension + character level representation
         # bidirectional=True, specifies that we are using the bidirectional LSTM
-        if self.char_mode == 'LSTM':
-            self.lstm = nn.LSTM(embedding_dim + self.char_lstm_dim * 2, hidden_dim, bidirectional=True)
-        if self.char_mode == 'CNN':
-            self.lstm = nn.LSTM(embedding_dim + self.out_channels, hidden_dim, bidirectional=True)
+        if self.encoder_mode == 'LSTM':
+            if self.char_mode == 'LSTM':
+                self.lstm = nn.LSTM(embedding_dim + self.char_lstm_dim * 2, hidden_dim, bidirectional=True)
+            if self.char_mode == 'CNN':
+                self.lstm = nn.LSTM(embedding_dim + self.out_channels, hidden_dim, bidirectional=True)
 
-        # Initializing the lstm layer using predefined function for initialization
-        init_lstm(self.lstm)
+            # Initializing the lstm layer using predefined function for initialization
+            init_lstm(self.lstm)
+
+            # Linear layer which maps the output of the bidirectional LSTM into tag space.
+            self.hidden2tag = nn.Linear(hidden_dim * 2, self.tagset_size)
+        # CNN (One-layer):
+        if self.encoder_mode == 'CNN':
+          # Conv layer
+          self.conv1 = nn.Conv2d(in_channels=1, out_channels=hidden_dim*2, kernel_size=(1,1), padding=(0,0))
+
+          # Initializing the conv layer
+          nn.init.xavier_uniform(self.conv1.weight)
+
+          if self.char_mode == 'LSTM':
+              print(f'embedding_dim={embedding_dim}, char_lstm_dim={self.char_lstm_dim*2}, in={embedding_dim+self.char_lstm_dim*2}')
+              self.maxpool1 = nn.MaxPool2d((1, embedding_dim+self.char_lstm_dim*2))
+          if self.char_mode == 'CNN':
+              print(f'embedding_dim={embedding_dim}, self.out_channels={self.out_channels}, in={embedding_dim+self.out_channels}')
+              self.maxpool1 = nn.MaxPool2d((1, embedding_dim+self.out_channels))
+
+        # CNN (Two-layer):
+        if self.encoder_mode == 'CNN2':
+          # Conv layer
+          self.conv1 = nn.Conv2d(in_channels=1, out_channels=hidden_dim*2, kernel_size=(1,1), padding=(0,0))
+          self.conv2 = nn.Conv2d(in_channels=hidden_dim*2, out_channels=hidden_dim*2, kernel_size=(1,1), padding=(0,0))
+
+          # Initializing the conv layer
+          nn.init.xavier_uniform(self.conv1.weight)
+          nn.init.xavier_uniform(self.conv2.weight)
+
+          self.maxpool1 = nn.MaxPool2d((1, 2))
+          self.maxpool2 = nn.MaxPool2d((1, (embedding_dim+self.out_channels)//2))
+
+        # CNN (Three-layer):
+        if self.encoder_mode == 'CNN3':
+          # Conv layer
+          self.conv1 = nn.Conv2d(in_channels=1, out_channels=hidden_dim*2, kernel_size=(1,1), padding=(0,0))
+          self.conv2 = nn.Conv2d(in_channels=hidden_dim*2, out_channels=hidden_dim*2, kernel_size=(1,1), padding=(0,0))
+          self.conv3 = nn.Conv2d(in_channels=hidden_dim*2, out_channels=hidden_dim*2, kernel_size=(1,1), padding=(0,0))
+
+          # Initializing the conv layer
+          nn.init.xavier_uniform(self.conv1.weight)
+          nn.init.xavier_uniform(self.conv2.weight)
+          nn.init.xavier_uniform(self.conv3.weight)
+
+          self.maxpool1 = nn.MaxPool2d((1, 2))
+          self.maxpool2 = nn.MaxPool2d((1, 2))
+          self.maxpool3 = nn.MaxPool2d((1, (embedding_dim+self.out_channels)//4))
+
+        # CNN (Dilated Three-layer):
+        if self.encoder_mode == 'CNN_DILATED':
+          # Conv layer
+          self.conv1 = nn.Conv2d(in_channels=1, out_channels=hidden_dim*2, kernel_size=(1,2), padding=(0,0), dilation=1)
+          self.conv2 = nn.Conv2d(in_channels=hidden_dim*2, out_channels=hidden_dim*2, kernel_size=(1,2), padding=(0,0), dilation=2)
+          self.conv3 = nn.Conv2d(in_channels=hidden_dim*2, out_channels=hidden_dim*2, kernel_size=(1,2), padding=(0,0), dilation=3)
+
+          # Initializing the conv layer
+          nn.init.xavier_uniform(self.conv1.weight)
+          nn.init.xavier_uniform(self.conv2.weight)
+          nn.init.xavier_uniform(self.conv3.weight)
+
+          self.maxpool1 = nn.MaxPool2d((1, 2))
+          self.maxpool2 = nn.MaxPool2d((1, 2))
+          self.maxpool3 = nn.MaxPool2d((1, 27))
 
         # Linear layer which maps the output of the bidirectional LSTM into tag space.
-        self.hidden2tag = nn.Linear(hidden_dim * 2, self.tagset_size)
+        self.hidden2tag = nn.Linear(hidden_dim*2, self.tagset_size)
 
         # Initializing the linear layer using predefined function for initialization
         init_linear(self.hidden2tag)
@@ -503,6 +649,7 @@ class BiLSTM_CRF(nn.Module):
     # assigning the functions, which we have defined earlier
     _score_sentence = score_sentences
     _get_lstm_features = get_lstm_features
+    _get_cnn_features = get_cnn_features
     _forward_alg = forward_alg
     viterbi_decode = viterbi_algo
     neg_log_likelihood = get_neg_log_likelihood
@@ -579,7 +726,8 @@ def evaluating(model, datas, best_F, dataset="Train"):
     r = correct_preds / total_correct if correct_preds > 0 else 0
     new_F = 2 * p * r / (p + r) if correct_preds > 0 else 0
 
-    print("{}: new_F: {} best_F: {} ".format(dataset, new_F, best_F))
+    print("%s: new_F: %s best_F: %s " %(dataset, new_F, best_F))
+    print('Accuracy:', p)
 
     # If our current F1-Score is better than the previous best, we update the best
     # to current F1 and we set the flag to indicate that we need to checkpoint this model
@@ -591,7 +739,11 @@ def evaluating(model, datas, best_F, dataset="Train"):
     return best_F, new_F, save
 
 
-def create_and_train_model():
+def create_train_model(char_mode,encoder_mode,crf, fig_name):
+    parameters['encoder_mode'] = encoder_mode
+    parameters['crf'] = crf 
+    parameters['char_mode'] = char_mode
+    print('Initialising model for Char Mode: %s , Encoder Mode: %s, CRF: %s ' %(parameters['char_mode'],parameters['encoder_mode'],parameters['crf']))
     # Create model
     model = BiLSTM_CRF(vocab_size=len(word_to_id),
                        tag_to_ix=tag_to_id,
@@ -601,8 +753,9 @@ def create_and_train_model():
                        char_to_ix=char_to_id,
                        pre_word_embeds=word_embeds,
                        use_crf=parameters['crf'],
-                       char_mode=parameters['char_mode'])
-                       #encoder_mode=parameters['encoder_mode'])
+                       char_mode=parameters['char_mode'],
+                       encoder_mode=parameters['encoder_mode'])
+    
 
     # Enable GPU
     if use_gpu:
@@ -625,7 +778,6 @@ def create_and_train_model():
     best_test_F = -1.0  # Current best F-1 Score on Test Set
     best_train_F = -1.0  # Current best F-1 Score on Train Set
     all_F = [[0, 0, 0]]  # List storing all the F-1 Scores
-    all_acc = [[0, 0, 0]]  # List storing all the Accuracy Scores
     eval_every = len(train_data)  # Calculate F-1 Score after this many iterations
     plot_every = 2000  # Store loss after this many iterations
     count = 0  # Counts the number of iterations
@@ -633,6 +785,7 @@ def create_and_train_model():
     tr = time.time()
     model.train(True)
     for epoch in range(1, number_of_epochs):
+        print('EPOCH:' , epoch)
         for i, index in enumerate(np.random.permutation(len(train_data))):
             count += 1
             data = train_data[index]
@@ -714,11 +867,21 @@ def create_and_train_model():
             if count % len(train_data) == 0:
                 adjust_learning_rate(optimizer, lr=learning_rate / (1 + decay_rate * count / len(train_data)))
 
-    print(time.time() - tr)
+    print('Time Taken:', (time.time() - tr)/60)
+    print('Losses:', losses)
+    
     plt.plot(losses)
+    fig = plt.gcf()
+    plt.draw()
+    img_path = '/home/arpit9295_2/Ayushi_Workspace/end_to_end_seq_labelling/img/%s' %(fig_name)
+    fig.savefig(img_path)
     plt.show()
+
+    total_params = 0
+    for param in model.parameters():
+        total_params += param.numel()
+    print('Total Params in the model are:', total_params)
 
 
     return all_F
 
-all_F_1_CNN = create_and_train_model()

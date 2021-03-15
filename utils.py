@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 import torch
 #Constants
 START_TAG = '<START>'
