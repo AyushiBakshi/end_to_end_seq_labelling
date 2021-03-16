@@ -88,7 +88,6 @@ def get_chunks(seq, tags):
         result = [("PER", 0, 2), ("LOC", 3, 4)]
 
     """
-
     # We assume by default the tags lie outside a named entity
     default = tags["O"]
 
@@ -98,6 +97,9 @@ def get_chunks(seq, tags):
 
     chunk_type, chunk_start = None, None
     for i, tok in enumerate(seq):
+        #Convert tensor tok to item
+        if type(tok) == torch.Tensor:
+            tok = tok.item()
         # End of a chunk 1
         if tok == default and chunk_type is not None:
             # Add a chunk.
